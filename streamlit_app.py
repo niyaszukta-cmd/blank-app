@@ -113,6 +113,28 @@ if not check_password():
 user_tier = get_user_tier()
 
 # ============================================================================
+# SESSION STATE INITIALIZATION FOR TIME MACHINE
+# ============================================================================
+
+def init_time_machine_state():
+    """Initialize all Time Machine session state variables"""
+    defaults = {
+        'data_snapshots': {},
+        'snapshot_times': [],
+        'selected_time_index': None,
+        'is_live_mode': True,
+        'last_capture_time': None,
+        'auto_capture': True,
+        'capture_interval': 3,
+        'force_capture': False
+    }
+    for key, value in defaults.items():
+        if key not in st.session_state:
+            st.session_state[key] = value
+
+init_time_machine_state()
+
+# ============================================================================
 # CUSTOM CSS
 # ============================================================================
 
@@ -146,15 +168,296 @@ st.markdown("""
         font-size: 1.2rem;
         font-weight: bold;
     }
+    .time-machine-container {
+        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+        padding: 1rem;
+        border-radius: 10px;
+        margin: 1rem 0;
+    }
+    .live-indicator {
+        display: inline-block;
+        width: 12px;
+        height: 12px;
+        background-color: #00ff88;
+        border-radius: 50%;
+        margin-right: 8px;
+        animation: pulse 2s infinite;
+    }
+    .historical-indicator {
+        color: #ffa500;
+        font-weight: bold;
+    }
+    @keyframes pulse {
+        0% { opacity: 1; box-shadow: 0 0 0 0 rgba(0, 255, 136, 0.7); }
+        50% { opacity: 0.7; box-shadow: 0 0 0 10px rgba(0, 255, 136, 0); }
+        100% { opacity: 1; box-shadow: 0 0 0 0 rgba(0, 255, 136, 0); }
+    }
 </style>
 """, unsafe_allow_html=True)
+
+# ============================================================================
+# TIME MACHINE FUNCTIONS
+# ============================================================================
+
+def capture_snapshot(df, futures_ltp, fetch_method, atm_info, flow_metrics):
+    """Capture current data as a snapshot for Time Machine"""
+    ist = pytz.timezone('Asia/Kolkata')
+    now = datetime.now(ist).replace(microsecond=0)
+    
+    # Check capture interval
+    if st.session_state.last_capture_time:
+        elapsed = (now - st.session_state.last_capture_time).total_seconds() / 60
+        if elapsed < st.session_state.capture_interval:
+            return False
+    
+    # Store snapshot
+    st.session_state.data_snapshots[now] = {
+        'df': df.copy(),
+        'futures_ltp': futures_ltp,
+        'fetch_method': fetch_method,
+        'atm_info': atm_info.copy() if atm_info else None,
+        'flow_metrics': flow_metrics.copy() if flow_metrics else None
+    }
+    
+    # Add to times list
+    if now not in st.session_state.snapshot_times:
+        st.session_state.snapshot_times.append(now)
+        st.session_state.snapshot_times.sort()
+    
+    st.session_state.last_capture_time = now
+    
+    # Limit to 500 snapshots (memory management)
+    while len(st.session_state.snapshot_times) > 500:
+        oldest = st.session_state.snapshot_times.pop(0)
+        st.session_state.data_snapshots.pop(oldest, None)
+    
+    return True
+
+
+def render_time_machine():
+    """Render the Time Machine UI with slider"""
+    st.markdown("---")
+    
+    # Header row
+    col1, col2, col3 = st.columns([3, 1, 1])
+    
+    with col1:
+        st.markdown("### ⏰ Time Machine - Backtest Mode")
+    
+    with col2:
+        if st.session_state.is_live_mode:
+            st.markdown('<span class="live-indicator"></span> **LIVE**', unsafe_allow_html=True)
+        else:
+            st.markdown('<span class="historical-indicator">📜 HISTORICAL</span>', unsafe_allow_html=True)
+    
+    with col3:
+        if not st.session_state.is_live_mode:
+            if st.button("🔴 Go Live", use_container_width=True, key="go_live_btn"):
+                st.session_state.is_live_mode = True
+                st.session_state.selected_time_index = None
+                st.rerun()
+    
+    # No snapshots yet
+    if not st.session_state.snapshot_times:
+        st.info("📝 No historical data yet. Snapshots will be captured automatically every few minutes.")
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.session_state.auto_capture = st.checkbox(
+                "🔄 Auto-capture enabled",
+                value=st.session_state.auto_capture,
+                key="auto_cap_empty"
+            )
+        with col2:
+            st.session_state.capture_interval = st.selectbox(
+                "Capture interval",
+                options=[1, 2, 3, 5, 10],
+                index=[1, 2, 3, 5, 10].index(st.session_state.capture_interval) if st.session_state.capture_interval in [1, 2, 3, 5, 10] else 2,
+                format_func=lambda x: f"{x} min",
+                key="interval_empty"
+            )
+        return None
+    
+    # Show time range info
+    first_time = st.session_state.snapshot_times[0]
+    last_time = st.session_state.snapshot_times[-1]
+    
+    st.caption(f"📊 **{len(st.session_state.snapshot_times)} snapshots** | {first_time.strftime('%I:%M %p')} → {last_time.strftime('%I:%M %p')}")
+    
+    # Time Slider
+    if len(st.session_state.snapshot_times) > 1:
+        time_labels = [t.strftime('%I:%M %p') for t in st.session_state.snapshot_times]
+        
+        current_idx = st.session_state.selected_time_index
+        if current_idx is None:
+            current_idx = len(st.session_state.snapshot_times) - 1
+        
+        selected_idx = st.select_slider(
+            "🕐 Select Time Point",
+            options=list(range(len(st.session_state.snapshot_times))),
+            value=current_idx,
+            format_func=lambda x: time_labels[x],
+            key="time_slider"
+        )
+        
+        # If not at latest, switch to historical mode
+        if selected_idx != len(st.session_state.snapshot_times) - 1:
+            st.session_state.is_live_mode = False
+            st.session_state.selected_time_index = selected_idx
+        
+        # Quick Jump Buttons
+        st.markdown("**⚡ Quick Jump:**")
+        cols = st.columns(8)
+        presets = [
+            ("5m", 5), ("15m", 15), ("30m", 30), ("1h", 60),
+            ("2h", 120), ("3h", 180), ("Start", 9999)
+        ]
+        
+        for idx, (label, minutes) in enumerate(presets):
+            with cols[idx]:
+                if st.button(label, key=f"preset_{minutes}", use_container_width=True):
+                    if minutes == 9999:
+                        target_idx = 0
+                    else:
+                        ist = pytz.timezone('Asia/Kolkata')
+                        target_time = datetime.now(ist) - timedelta(minutes=minutes)
+                        # Find closest snapshot
+                        target_idx = min(
+                            range(len(st.session_state.snapshot_times)),
+                            key=lambda i: abs((st.session_state.snapshot_times[i] - target_time).total_seconds())
+                        )
+                    st.session_state.selected_time_index = target_idx
+                    st.session_state.is_live_mode = False
+                    st.rerun()
+    
+    # Capture Settings Expander
+    with st.expander("⚙️ Capture Settings"):
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.session_state.auto_capture = st.checkbox(
+                "🔄 Auto-capture",
+                value=st.session_state.auto_capture,
+                key="auto_cap_settings"
+            )
+        
+        with col2:
+            st.session_state.capture_interval = st.selectbox(
+                "Interval",
+                options=[1, 2, 3, 5, 10],
+                index=[1, 2, 3, 5, 10].index(st.session_state.capture_interval) if st.session_state.capture_interval in [1, 2, 3, 5, 10] else 2,
+                format_func=lambda x: f"{x} min",
+                key="interval_settings"
+            )
+        
+        with col3:
+            if st.button("🗑️ Clear History", use_container_width=True):
+                st.session_state.data_snapshots = {}
+                st.session_state.snapshot_times = []
+                st.session_state.selected_time_index = None
+                st.session_state.is_live_mode = True
+                st.rerun()
+    
+    # Return historical data if in historical mode
+    if not st.session_state.is_live_mode and st.session_state.selected_time_index is not None:
+        selected_time = st.session_state.snapshot_times[st.session_state.selected_time_index]
+        return st.session_state.data_snapshots.get(selected_time)
+    
+    return None
+
+
+def create_history_chart():
+    """Create intraday price and GEX flow history chart"""
+    if len(st.session_state.snapshot_times) < 2:
+        return None
+    
+    times = []
+    prices = []
+    gex_values = []
+    
+    for t in st.session_state.snapshot_times:
+        if t in st.session_state.data_snapshots:
+            snapshot = st.session_state.data_snapshots[t]
+            times.append(t)
+            prices.append(snapshot['futures_ltp'])
+            
+            # Get GEX total from flow_metrics or calculate from df
+            if snapshot.get('flow_metrics') and 'gex_near_total' in snapshot['flow_metrics']:
+                gex_values.append(snapshot['flow_metrics']['gex_near_total'])
+            else:
+                gex_values.append(float(snapshot['df']['Net_GEX_B'].sum()))
+    
+    if len(times) < 2:
+        return None
+    
+    # Create subplot with price on top, GEX below
+    fig = make_subplots(
+        rows=2, cols=1,
+        shared_xaxes=True,
+        row_heights=[0.65, 0.35],
+        vertical_spacing=0.08,
+        subplot_titles=('📈 Futures Price', '📊 GEX Flow')
+    )
+    
+    # Price line
+    fig.add_trace(
+        go.Scatter(
+            x=times, y=prices,
+            mode='lines+markers',
+            line=dict(color='#6c5ce7', width=2),
+            marker=dict(size=5),
+            name='Futures',
+            hovertemplate='%{x|%I:%M %p}<br>₹%{y:,.2f}<extra></extra>'
+        ),
+        row=1, col=1
+    )
+    
+    # GEX bars
+    gex_colors = ['#00d4aa' if x > 0 else '#ff6b6b' for x in gex_values]
+    fig.add_trace(
+        go.Bar(
+            x=times, y=gex_values,
+            marker_color=gex_colors,
+            name='GEX Flow',
+            hovertemplate='%{x|%I:%M %p}<br>GEX: %{y:.4f}B<extra></extra>'
+        ),
+        row=2, col=1
+    )
+    
+    # Mark selected time if in historical mode
+    if not st.session_state.is_live_mode and st.session_state.selected_time_index is not None:
+        selected_time = st.session_state.snapshot_times[st.session_state.selected_time_index]
+        if selected_time in st.session_state.data_snapshots:
+            selected_price = st.session_state.data_snapshots[selected_time]['futures_ltp']
+            fig.add_vline(x=selected_time, line_dash="dash", line_color="orange", line_width=2)
+            fig.add_annotation(
+                x=selected_time, y=selected_price,
+                text="📍 Selected",
+                showarrow=True, arrowhead=2,
+                row=1, col=1
+            )
+    
+    fig.update_layout(
+        height=300,
+        showlegend=False,
+        template='plotly_dark',
+        margin=dict(l=50, r=50, t=50, b=30),
+        paper_bgcolor='rgba(26, 26, 46, 0.8)',
+        plot_bgcolor='rgba(26, 26, 46, 0.8)'
+    )
+    
+    fig.update_xaxes(showgrid=False)
+    fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
+    
+    return fig
+
 
 # ============================================================================
 # HEADER
 # ============================================================================
 
 st.markdown('<p class="main-header">📊 NYZTrade - Advanced GEX + DEX Analysis</p>', unsafe_allow_html=True)
-st.markdown("**Real-time Gamma & Delta Exposure Analysis for Indian Markets**")
+st.markdown("**Real-time Gamma & Delta Exposure Analysis for Indian Markets | With Time Machine Backtest**")
 
 # User badge
 if user_tier == "premium":
@@ -194,6 +497,21 @@ expiry_index = st.sidebar.selectbox(
     index=0
 )
 
+# Time Machine Stats in Sidebar
+st.sidebar.markdown("---")
+st.sidebar.subheader("⏰ Time Machine Stats")
+
+if st.session_state.snapshot_times:
+    st.sidebar.metric("Snapshots", len(st.session_state.snapshot_times))
+    st.sidebar.caption(f"First: {st.session_state.snapshot_times[0].strftime('%I:%M %p')}")
+    st.sidebar.caption(f"Last: {st.session_state.snapshot_times[-1].strftime('%I:%M %p')}")
+else:
+    st.sidebar.info("No snapshots yet")
+
+# Manual Capture Button
+if st.sidebar.button("📸 Capture Now", use_container_width=True, type="primary"):
+    st.session_state.force_capture = True
+
 # Auto-refresh
 st.sidebar.markdown("---")
 st.sidebar.subheader("🔄 Auto-Refresh")
@@ -230,6 +548,18 @@ if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
     st.rerun()
 
 # ============================================================================
+# TIME MACHINE UI
+# ============================================================================
+
+historical_data = render_time_machine()
+
+# Display History Chart if we have snapshots
+if len(st.session_state.snapshot_times) >= 2:
+    history_chart = create_history_chart()
+    if history_chart:
+        st.plotly_chart(history_chart, use_container_width=True)
+
+# ============================================================================
 # DATA FETCHING
 # ============================================================================
 
@@ -250,27 +580,59 @@ def fetch_data(symbol, strikes_range, expiry_index):
         return None, None, None, None, str(e)
 
 # ============================================================================
-# MAIN ANALYSIS
+# MAIN ANALYSIS - LOAD DATA
 # ============================================================================
 
 st.markdown("---")
 
-with st.spinner(f"🔄 Fetching live {symbol} data..."):
-    df, futures_ltp, fetch_method, atm_info, error = fetch_data(symbol, strikes_range, expiry_index)
-
-if error:
-    st.error(f"❌ Error: {error}")
-    st.info("""
-    **Troubleshooting:**
-    1. Make sure gex_calculator.py is uploaded
-    2. Check requirements.txt includes: streamlit pandas numpy plotly scipy requests pytz
-    3. Wait 1-2 minutes for dependencies
-    """)
-    st.stop()
-
-if df is None:
-    st.error("❌ Failed to fetch data")
-    st.stop()
+# Check if we're viewing historical data
+if historical_data and not st.session_state.is_live_mode:
+    # Use historical data
+    df = historical_data['df']
+    futures_ltp = historical_data['futures_ltp']
+    fetch_method = historical_data['fetch_method']
+    atm_info = historical_data['atm_info']
+    flow_metrics = historical_data['flow_metrics']
+    
+    is_historical = True
+    hist_time = st.session_state.snapshot_times[st.session_state.selected_time_index]
+    
+    st.warning(f"📜 **HISTORICAL MODE** - Viewing data from {hist_time.strftime('%I:%M:%S %p IST')}")
+else:
+    # Fetch live data
+    is_historical = False
+    hist_time = None
+    
+    with st.spinner(f"🔄 Fetching live {symbol} data..."):
+        df, futures_ltp, fetch_method, atm_info, error = fetch_data(symbol, strikes_range, expiry_index)
+    
+    if error:
+        st.error(f"❌ Error: {error}")
+        st.info("""
+        **Troubleshooting:**
+        1. Make sure gex_calculator.py is uploaded
+        2. Check requirements.txt includes: streamlit pandas numpy plotly scipy requests pytz
+        3. Wait 1-2 minutes for dependencies
+        """)
+        st.stop()
+    
+    if df is None:
+        st.error("❌ Failed to fetch data")
+        st.stop()
+    
+    # Calculate flow metrics for live data
+    try:
+        flow_metrics = calculate_dual_gex_dex_flow(df, futures_ltp)
+    except Exception as e:
+        flow_metrics = None
+    
+    # Auto-capture snapshot
+    if st.session_state.auto_capture or st.session_state.force_capture:
+        if capture_snapshot(df, futures_ltp, fetch_method, atm_info, flow_metrics):
+            st.toast("📸 Snapshot captured!", icon="✅")
+        st.session_state.force_capture = False
+    
+    st.success(f"🔴 **LIVE MODE** - Real-time data via {fetch_method}")
 
 # ============================================================================
 # KEY METRICS
@@ -297,19 +659,17 @@ with col3:
     st.metric("Put GEX", f"{put_gex:.4f}B")
 
 with col4:
-    st.metric("Futures LTP", f"Rs {futures_ltp:,.2f}")
+    st.metric("Futures LTP", f"₹{futures_ltp:,.2f}")
 
 with col5:
     if atm_info:
-        st.metric("ATM Straddle", f"Rs {atm_info['atm_straddle_premium']:.2f}")
+        st.metric("ATM Straddle", f"₹{atm_info['atm_straddle_premium']:.2f}")
 
 # ============================================================================
 # FLOW METRICS
 # ============================================================================
 
-try:
-    flow_metrics = calculate_dual_gex_dex_flow(df, futures_ltp)
-    
+if flow_metrics:
     st.markdown("---")
     col1, col2, col3 = st.columns(3)
     
@@ -327,10 +687,8 @@ try:
     with col3:
         combined_bias = flow_metrics['combined_bias']
         st.info(f"**Combined:** {combined_bias}")
-        
-except Exception as e:
-    flow_metrics = None
-    st.warning(f"Flow metrics unavailable: {e}")
+else:
+    st.warning("Flow metrics unavailable")
 
 # ============================================================================
 # GAMMA FLIP ZONES
@@ -353,7 +711,8 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 GEX Profile", "📈 DEX Profile", 
 
 # TAB 1: GEX Profile
 with tab1:
-    st.subheader(f"NYZTrade - {symbol} Gamma Exposure Profile")
+    mode_text = f"[HISTORICAL - {hist_time.strftime('%I:%M %p')}]" if is_historical else "[LIVE]"
+    st.subheader(f"NYZTrade - {symbol} Gamma Exposure Profile {mode_text}")
     
     fig = go.Figure()
     
@@ -410,7 +769,8 @@ with tab1:
 
 # TAB 2: DEX Profile
 with tab2:
-    st.subheader(f"NYZTrade - {symbol} Delta Exposure Profile")
+    mode_text = f"[HISTORICAL - {hist_time.strftime('%I:%M %p')}]" if is_historical else "[LIVE]"
+    st.subheader(f"NYZTrade - {symbol} Delta Exposure Profile {mode_text}")
     
     fig2 = go.Figure()
     
@@ -443,7 +803,8 @@ with tab2:
 
 # TAB 3: Hedging Pressure
 with tab3:
-    st.subheader(f"NYZTrade - {symbol} Hedging Pressure Index")
+    mode_text = f"[HISTORICAL - {hist_time.strftime('%I:%M %p')}]" if is_historical else "[LIVE]"
+    st.subheader(f"NYZTrade - {symbol} Hedging Pressure Index {mode_text}")
     
     fig3 = go.Figure()
     
@@ -501,6 +862,9 @@ with tab3:
 with tab4:
     st.subheader("Strike-wise Analysis")
     
+    if is_historical:
+        st.caption(f"📜 Historical data from {hist_time.strftime('%I:%M:%S %p IST')}")
+    
     display_cols = ['Strike', 'Call_OI', 'Put_OI', 'Net_GEX_B', 'Net_DEX_B', 'Hedging_Pressure', 'Total_Volume']
     display_df = df[display_cols].copy()
     
@@ -514,10 +878,11 @@ with tab4:
     st.dataframe(display_df, use_container_width=True, height=400)
     
     csv = df.to_csv(index=False)
+    timestamp = hist_time.strftime('%Y%m%d_%H%M') if is_historical else get_ist_time().strftime('%Y%m%d_%H%M')
     st.download_button(
         label="📥 Download CSV",
         data=csv,
-        file_name=f"NYZTrade_{symbol}_{get_ist_time().strftime('%Y%m%d_%H%M')}.csv",
+        file_name=f"NYZTrade_{symbol}_{timestamp}.csv",
         mime="text/csv",
         use_container_width=True
     )
@@ -525,6 +890,9 @@ with tab4:
 # TAB 5: Strategies
 with tab5:
     st.subheader("💡 Trading Strategies")
+    
+    if is_historical:
+        st.info(f"📜 Strategies based on historical data from {hist_time.strftime('%I:%M %p IST')}")
     
     if flow_metrics and atm_info:
         gex_bias_val = flow_metrics['gex_near_total']
@@ -538,7 +906,7 @@ with tab5:
             st.metric("DEX Flow", f"{dex_bias_val:.2f}")
         with col2:
             st.metric("ATM Strike", f"{atm_info['atm_strike']}")
-            st.metric("Straddle Premium", f"Rs {atm_info['atm_straddle_premium']:.2f}")
+            st.metric("Straddle Premium", f"₹{atm_info['atm_straddle_premium']:.2f}")
         
         st.markdown("---")
         
@@ -547,7 +915,7 @@ with tab5:
             st.success("### 🟢 Strong Positive GEX - Sideways/Bullish")
             
             st.markdown("#### Strategy 1: Iron Condor")
-            st.text(f"""
+            st.code(f"""
 Sell {symbol} {int(futures_ltp)} CE
 Buy  {symbol} {int(futures_ltp + 200)} CE
 Sell {symbol} {int(futures_ltp)} PE
@@ -559,12 +927,12 @@ Best: Price stays {int(futures_ltp - 100)} to {int(futures_ltp + 100)}
             """)
             
             st.markdown("#### Strategy 2: Short Straddle")
-            st.text(f"""
+            st.code(f"""
 Sell {symbol} {atm_info['atm_strike']} CE + PE
 
-Premium: Rs {atm_info['atm_straddle_premium']:.2f}
+Premium: ₹{atm_info['atm_straddle_premium']:.2f}
 Risk: HIGH - Use stops
-Exit if price moves Rs {atm_info['atm_straddle_premium']*0.5:.2f}
+Exit if price moves ₹{atm_info['atm_straddle_premium']*0.5:.2f}
             """)
         
         # Negative GEX
@@ -572,10 +940,10 @@ Exit if price moves Rs {atm_info['atm_straddle_premium']*0.5:.2f}
             st.error("### 🔴 Negative GEX - High Volatility")
             
             st.markdown("#### Strategy: Long Straddle")
-            st.text(f"""
+            st.code(f"""
 Buy {symbol} {atm_info['atm_strike']} CE + PE
 
-Cost: Rs {atm_info['atm_straddle_premium']:.2f}
+Cost: ₹{atm_info['atm_straddle_premium']:.2f}
 Upper BE: {atm_info['atm_strike'] + atm_info['atm_straddle_premium']:.0f}
 Lower BE: {atm_info['atm_strike'] - atm_info['atm_straddle_premium']:.0f}
 Risk: HIGH - Needs big move
@@ -587,14 +955,14 @@ Risk: HIGH - Needs big move
             
             if dex_bias_val > 20:
                 st.markdown("#### Bull Call Spread")
-                st.text(f"""
+                st.code(f"""
 Buy  {symbol} {int(futures_ltp)} CE
 Sell {symbol} {int(futures_ltp + 100)} CE
 Risk: MODERATE
                 """)
             elif dex_bias_val < -20:
                 st.markdown("#### Bear Put Spread")
-                st.text(f"""
+                st.code(f"""
 Buy  {symbol} {int(futures_ltp)} PE
 Sell {symbol} {int(futures_ltp - 100)} PE
 Risk: MODERATE
@@ -634,7 +1002,10 @@ with col2:
     st.info(f"📅 {ist_time.strftime('%d %b %Y')}")
 
 with col3:
-    st.info(f"📊 {symbol}")
+    if is_historical:
+        st.warning(f"📜 Historical: {hist_time.strftime('%I:%M %p')}")
+    else:
+        st.success(f"🔴 Live: {symbol}")
 
 with col4:
     if gamma_flip_zones:
@@ -642,13 +1013,13 @@ with col4:
     else:
         st.success("✅ No Flips")
 
-st.markdown(f"**💡 NYZTrade YouTube | Data: {fetch_method}**")
+st.markdown(f"**💡 NYZTrade YouTube | Data: {fetch_method} | Snapshots: {len(st.session_state.snapshot_times)}**")
 
 # ============================================================================
 # AUTO-REFRESH
 # ============================================================================
 
-if auto_refresh and user_tier == "premium":
+if auto_refresh and user_tier == "premium" and st.session_state.is_live_mode:
     elapsed = time.time() - st.session_state.countdown_start
     if elapsed >= refresh_interval:
         st.session_state.countdown_start = time.time()
