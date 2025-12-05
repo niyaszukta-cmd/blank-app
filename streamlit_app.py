@@ -1,16 +1,3 @@
-"""
-================================================================================
-NYZTrade - Advanced GEX + DEX Analysis Dashboard
-================================================================================
-With Time Machine that works for ALL expiries (Weekly, Next Weekly, Monthly)
-Updated Terminology:
-- Positive GEX = Volatility Dampening
-- Negative GEX = Volatility Amplifying
-
-Author: NYZTrade
-================================================================================
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -18,15 +5,29 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 from datetime import datetime, timedelta
 import time
+import sqlite3
+import os
 import pytz
 
-# Import calculator
+# Try importing calculator
 try:
     from gex_calculator import EnhancedGEXDEXCalculator, calculate_dual_gex_dex_flow, detect_gamma_flip_zones
     CALCULATOR_AVAILABLE = True
 except Exception as e:
     CALCULATOR_AVAILABLE = False
     IMPORT_ERROR = str(e)
+
+# Try importing data collector functions
+try:
+    from data_collector import (
+        get_available_dates, get_snapshots_for_date, get_strike_data,
+        get_flow_metrics, get_intraday_history, get_database_stats,
+        DATABASE_FILE
+    )
+    DATABASE_AVAILABLE = os.path.exists(DATABASE_FILE)
+except:
+    DATABASE_AVAILABLE = False
+    DATABASE_FILE = "gex_dex_history.db"
 
 # ============================================================================
 # AUTHENTICATION FUNCTIONS
@@ -95,8 +96,11 @@ def check_password():
 def get_user_tier():
     if "authenticated_user" not in st.session_state:
         return "guest"
+    
     username = st.session_state["authenticated_user"]
-    return "premium" if username in ["premium", "niyas"] else "basic"
+    premium_users = ["premium", "niyas"]
+    
+    return "premium" if username in premium_users else "basic"
 
 def get_ist_time():
     """Get current time in IST"""
@@ -121,24 +125,20 @@ if not check_password():
 user_tier = get_user_tier()
 
 # ============================================================================
-# SESSION STATE INITIALIZATION - FIXED FOR MULTIPLE EXPIRIES
+# SESSION STATE INITIALIZATION
 # ============================================================================
 
 def init_session_state():
-    """Initialize all session state variables with expiry-specific storage"""
+    """Initialize session state variables"""
     defaults = {
-        # Time Machine data - stored per symbol+expiry combination
-        'snapshots_by_config': {},  # Key: "SYMBOL_EXPIRY_INDEX" -> {times: [], data: {}}
-        'current_config_key': None,
-        'selected_time_index': None,
-        'is_live_mode': True,
-        'last_capture_time': None,
+        'view_mode': 'live',  # 'live' or 'historical'
+        'selected_date': None,
+        'selected_snapshot_id': None,
+        'session_snapshots': {},  # For session-based captures
+        'session_times': [],
         'auto_capture': True,
         'capture_interval': 3,
-        'force_capture': False,
-        # Settings
-        'previous_symbol': None,
-        'previous_expiry': None
+        'last_capture_time': None
     }
     for key, value in defaults.items():
         if key not in st.session_state:
@@ -164,65 +164,25 @@ st.markdown("""
         border-left: 5px solid #28a745;
         padding: 1rem;
         margin: 1rem 0;
-        border-radius: 5px;
     }
     .warning-box {
         background-color: #fff3cd;
         border-left: 5px solid #ffc107;
         padding: 1rem;
         margin: 1rem 0;
-        border-radius: 5px;
     }
-    .danger-box {
-        background-color: #f8d7da;
-        border-left: 5px solid #dc3545;
-        padding: 1rem;
-        margin: 1rem 0;
-        border-radius: 5px;
-    }
-    .countdown-timer {
-        background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    .db-status {
+        background: linear-gradient(135deg, #11998e 0%, #38ef7d 100%);
         color: white;
         padding: 0.5rem 1rem;
         border-radius: 8px;
         text-align: center;
-        font-size: 1.2rem;
         font-weight: bold;
     }
-    .time-machine-box {
-        background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
-        padding: 1rem;
-        border-radius: 10px;
-        margin: 1rem 0;
-        border: 1px solid #333;
-    }
-    .live-badge {
-        background: linear-gradient(90deg, #00b894, #00cec9);
+    .db-offline {
+        background: linear-gradient(135deg, #eb3349 0%, #f45c43 100%);
         color: white;
-        padding: 5px 15px;
-        border-radius: 20px;
-        font-weight: bold;
-        display: inline-block;
-    }
-    .hist-badge {
-        background: linear-gradient(90deg, #fdcb6e, #e17055);
-        color: white;
-        padding: 5px 15px;
-        border-radius: 20px;
-        font-weight: bold;
-        display: inline-block;
-    }
-    .dampening-box {
-        background: linear-gradient(135deg, #00b894, #00cec9);
-        color: white;
-        padding: 1rem;
-        border-radius: 8px;
-        text-align: center;
-    }
-    .amplifying-box {
-        background: linear-gradient(135deg, #e74c3c, #c0392b);
-        color: white;
-        padding: 1rem;
+        padding: 0.5rem 1rem;
         border-radius: 8px;
         text-align: center;
     }
@@ -230,306 +190,136 @@ st.markdown("""
 """, unsafe_allow_html=True)
 
 # ============================================================================
-# TIME MACHINE FUNCTIONS - FIXED FOR MULTIPLE EXPIRIES
+# DATABASE HELPER FUNCTIONS
 # ============================================================================
 
-def get_config_key(symbol, expiry_index):
-    """Generate unique key for symbol+expiry combination"""
-    return f"{symbol}_{expiry_index}"
+def check_database():
+    """Check if database exists and has data"""
+    if not os.path.exists(DATABASE_FILE):
+        return False, "Database file not found"
+    
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM snapshots")
+        count = cursor.fetchone()[0]
+        conn.close()
+        
+        if count > 0:
+            return True, f"{count} snapshots available"
+        return False, "Database empty"
+    except Exception as e:
+        return False, str(e)
 
-def get_current_snapshots():
-    """Get snapshots for current symbol+expiry configuration"""
-    key = st.session_state.current_config_key
-    if key and key in st.session_state.snapshots_by_config:
-        return st.session_state.snapshots_by_config[key]
-    return {'times': [], 'data': {}}
 
-def capture_snapshot(df, futures_ltp, fetch_method, atm_info, flow_metrics, symbol, expiry_index):
-    """Capture snapshot for specific symbol+expiry configuration"""
-    ist = pytz.timezone('Asia/Kolkata')
-    now = datetime.now(ist).replace(microsecond=0)
-    
-    # Check capture interval
-    if st.session_state.last_capture_time:
-        elapsed = (now - st.session_state.last_capture_time).total_seconds() / 60
-        if elapsed < st.session_state.capture_interval and not st.session_state.force_capture:
-            return False
-    
-    # Get config key
-    config_key = get_config_key(symbol, expiry_index)
-    
-    # Initialize if needed
-    if config_key not in st.session_state.snapshots_by_config:
-        st.session_state.snapshots_by_config[config_key] = {'times': [], 'data': {}}
-    
-    config = st.session_state.snapshots_by_config[config_key]
-    
-    # Store snapshot
-    config['data'][now] = {
-        'df': df.copy(),
-        'futures_ltp': futures_ltp,
-        'fetch_method': fetch_method,
-        'atm_info': atm_info.copy() if atm_info else None,
-        'flow_metrics': flow_metrics.copy() if flow_metrics else None,
-        'symbol': symbol,
-        'expiry_index': expiry_index
-    }
-    
-    # Add to times list
-    if now not in config['times']:
-        config['times'].append(now)
-        config['times'].sort()
-    
-    st.session_state.last_capture_time = now
-    st.session_state.force_capture = False
-    
-    # Limit to 500 snapshots per config
-    while len(config['times']) > 500:
-        oldest = config['times'].pop(0)
-        config['data'].pop(oldest, None)
-    
-    return True
-
-def render_time_machine(symbol, expiry_index):
-    """Render Time Machine UI for specific symbol+expiry"""
-    st.markdown("---")
-    
-    # Update current config key
-    config_key = get_config_key(symbol, expiry_index)
-    
-    # Check if config changed
-    if st.session_state.current_config_key != config_key:
-        st.session_state.current_config_key = config_key
-        st.session_state.selected_time_index = None
-        st.session_state.is_live_mode = True
-    
-    # Get snapshots for this config
-    config = get_current_snapshots()
-    snapshot_times = config.get('times', [])
-    snapshot_data = config.get('data', {})
-    
-    # Expiry labels
-    expiry_labels = {0: "Current Weekly", 1: "Next Weekly", 2: "Monthly"}
-    expiry_label = expiry_labels.get(expiry_index, f"Expiry {expiry_index}")
-    
-    # Header
-    col1, col2, col3 = st.columns([3, 1, 1])
-    
-    with col1:
-        st.markdown(f"### ⏰ Time Machine - {symbol} ({expiry_label})")
-    
-    with col2:
-        if st.session_state.is_live_mode:
-            st.markdown('<span class="live-badge">🟢 LIVE</span>', unsafe_allow_html=True)
+def load_snapshot_from_db(snapshot_id):
+    """Load complete snapshot data from database"""
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        # Get snapshot info
+        cursor.execute("""
+            SELECT timestamp, symbol, futures_ltp, spot_price, fetch_method,
+                   total_gex, total_dex, gex_bias, dex_bias, combined_bias,
+                   atm_strike, atm_straddle_premium, pcr, expiry_date
+            FROM snapshots WHERE id = ?
+        """, (snapshot_id,))
+        
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return None, None, None, None, None
+        
+        timestamp, symbol, futures_ltp, spot_price, fetch_method = row[:5]
+        total_gex, total_dex, gex_bias, dex_bias, combined_bias = row[5:10]
+        atm_strike, atm_straddle_premium, pcr, expiry_date = row[10:]
+        
+        # Get strike data
+        df = pd.read_sql_query("""
+            SELECT strike as Strike, call_oi as Call_OI, put_oi as Put_OI,
+                   call_oi_change as Call_OI_Change, put_oi_change as Put_OI_Change,
+                   call_volume as Call_Volume, put_volume as Put_Volume,
+                   call_iv as Call_IV, put_iv as Put_IV,
+                   call_ltp as Call_LTP, put_ltp as Put_LTP,
+                   net_gex as Net_GEX_B, net_dex as Net_DEX_B,
+                   hedging_pressure as Hedging_Pressure
+            FROM strike_data WHERE snapshot_id = ?
+            ORDER BY strike ASC
+        """, conn, params=(snapshot_id,))
+        
+        # Add computed columns
+        df['Total_Volume'] = df['Call_Volume'] + df['Put_Volume']
+        df['Call_GEX'] = df['Net_GEX_B'].clip(lower=0)
+        df['Put_GEX'] = df['Net_GEX_B'].clip(upper=0)
+        
+        # Get flow metrics
+        cursor.execute("""
+            SELECT gex_near_total, gex_near_positive, gex_near_negative,
+                   dex_near_total, dex_near_positive, dex_near_negative,
+                   combined_signal, max_call_oi_strike, max_put_oi_strike
+            FROM flow_metrics WHERE snapshot_id = ?
+        """, (snapshot_id,))
+        
+        flow_row = cursor.fetchone()
+        if flow_row:
+            flow_metrics = {
+                'gex_near_total': flow_row[0],
+                'gex_near_positive': flow_row[1],
+                'gex_near_negative': flow_row[2],
+                'gex_near_bias': gex_bias,
+                'dex_near_total': flow_row[3],
+                'dex_near_positive': flow_row[4],
+                'dex_near_negative': flow_row[5],
+                'dex_near_bias': dex_bias,
+                'combined_signal': flow_row[6],
+                'combined_bias': combined_bias,
+                'max_call_oi_strike': flow_row[7],
+                'max_put_oi_strike': flow_row[8]
+            }
         else:
-            st.markdown('<span class="hist-badge">📜 HISTORY</span>', unsafe_allow_html=True)
-    
-    with col3:
-        if not st.session_state.is_live_mode:
-            if st.button("🔴 Go Live", use_container_width=True, key="go_live_btn"):
-                st.session_state.is_live_mode = True
-                st.session_state.selected_time_index = None
-                st.rerun()
-    
-    # No snapshots yet
-    if not snapshot_times:
-        st.info(f"📝 No snapshots yet for {symbol} ({expiry_label}). Data will be captured automatically.")
+            flow_metrics = {
+                'gex_near_bias': gex_bias,
+                'dex_near_bias': dex_bias,
+                'combined_bias': combined_bias,
+                'gex_near_total': total_gex,
+                'dex_near_total': total_dex
+            }
         
-        col1, col2 = st.columns(2)
-        with col1:
-            st.session_state.auto_capture = st.checkbox(
-                "🔄 Auto-capture enabled",
-                value=st.session_state.auto_capture,
-                key="auto_cap_empty"
-            )
-        with col2:
-            st.session_state.capture_interval = st.selectbox(
-                "Capture interval",
-                options=[1, 2, 3, 5, 10],
-                index=[1, 2, 3, 5, 10].index(st.session_state.capture_interval) if st.session_state.capture_interval in [1, 2, 3, 5, 10] else 2,
-                format_func=lambda x: f"{x} min",
-                key="interval_empty"
-            )
-        return None
-    
-    # Show time range info
-    first_time = snapshot_times[0]
-    last_time = snapshot_times[-1]
-    
-    st.caption(f"📊 **{len(snapshot_times)} snapshots** for {symbol} ({expiry_label}) | {first_time.strftime('%I:%M %p')} → {last_time.strftime('%I:%M %p')}")
-    
-    # Time Slider
-    if len(snapshot_times) > 1:
-        time_labels = [t.strftime('%I:%M %p') for t in snapshot_times]
+        atm_info = {
+            'atm_strike': atm_strike,
+            'atm_straddle_premium': atm_straddle_premium,
+            'spot_price': spot_price,
+            'expiry_date': expiry_date
+        }
         
-        current_idx = st.session_state.selected_time_index
-        if current_idx is None or current_idx >= len(snapshot_times):
-            current_idx = len(snapshot_times) - 1
+        conn.close()
         
-        selected_idx = st.select_slider(
-            "🕐 Select Time Point",
-            options=list(range(len(snapshot_times))),
-            value=current_idx,
-            format_func=lambda x: time_labels[x],
-            key="time_slider"
-        )
+        return df, futures_ltp, fetch_method, atm_info, flow_metrics, timestamp
         
-        # If not at latest, switch to historical mode
-        if selected_idx != len(snapshot_times) - 1:
-            st.session_state.is_live_mode = False
-            st.session_state.selected_time_index = selected_idx
-        
-        # Quick Jump Buttons
-        st.markdown("**⚡ Quick Jump:**")
-        cols = st.columns(8)
-        presets = [
-            ("5m", 5), ("15m", 15), ("30m", 30), ("1h", 60),
-            ("2h", 120), ("3h", 180), ("Start", 9999)
-        ]
-        
-        for idx, (label, minutes) in enumerate(presets):
-            with cols[idx]:
-                if st.button(label, key=f"preset_{label}_{config_key}", use_container_width=True):
-                    if minutes == 9999:
-                        target_idx = 0
-                    else:
-                        ist = pytz.timezone('Asia/Kolkata')
-                        target_time = datetime.now(ist) - timedelta(minutes=minutes)
-                        target_idx = min(
-                            range(len(snapshot_times)),
-                            key=lambda i: abs((snapshot_times[i] - target_time).total_seconds())
-                        )
-                    st.session_state.selected_time_index = target_idx
-                    st.session_state.is_live_mode = False
-                    st.rerun()
-    
-    # Capture Settings
-    with st.expander("⚙️ Capture Settings"):
-        col1, col2, col3 = st.columns(3)
-        
-        with col1:
-            st.session_state.auto_capture = st.checkbox(
-                "🔄 Auto-capture",
-                value=st.session_state.auto_capture,
-                key="auto_cap_settings"
-            )
-        
-        with col2:
-            st.session_state.capture_interval = st.selectbox(
-                "Interval",
-                options=[1, 2, 3, 5, 10],
-                index=[1, 2, 3, 5, 10].index(st.session_state.capture_interval) if st.session_state.capture_interval in [1, 2, 3, 5, 10] else 2,
-                format_func=lambda x: f"{x} min",
-                key="interval_settings"
-            )
-        
-        with col3:
-            if st.button("🗑️ Clear This Config", use_container_width=True):
-                if config_key in st.session_state.snapshots_by_config:
-                    st.session_state.snapshots_by_config[config_key] = {'times': [], 'data': {}}
-                st.session_state.selected_time_index = None
-                st.session_state.is_live_mode = True
-                st.rerun()
-        
-        # Show all configs
-        st.markdown("**📁 All Stored Configurations:**")
-        for key in st.session_state.snapshots_by_config:
-            count = len(st.session_state.snapshots_by_config[key].get('times', []))
-            if count > 0:
-                parts = key.split('_')
-                sym = parts[0]
-                exp = int(parts[1]) if len(parts) > 1 else 0
-                exp_lbl = expiry_labels.get(exp, f"Exp {exp}")
-                st.caption(f"• {sym} ({exp_lbl}): {count} snapshots")
-    
-    # Return historical data if in historical mode
-    if not st.session_state.is_live_mode and st.session_state.selected_time_index is not None:
-        if st.session_state.selected_time_index < len(snapshot_times):
-            selected_time = snapshot_times[st.session_state.selected_time_index]
-            return snapshot_data.get(selected_time)
-    
-    return None
+    except Exception as e:
+        return None, None, None, None, None, None
 
 
-def create_history_chart(symbol, expiry_index):
-    """Create intraday history chart for specific config"""
-    config = get_current_snapshots()
-    snapshot_times = config.get('times', [])
-    snapshot_data = config.get('data', {})
-    
-    if len(snapshot_times) < 2:
-        return None
-    
-    times = []
-    prices = []
-    gex_values = []
-    
-    for t in snapshot_times:
-        if t in snapshot_data:
-            snap = snapshot_data[t]
-            times.append(t)
-            prices.append(snap['futures_ltp'])
-            
-            if snap.get('flow_metrics') and 'gex_near_total' in snap['flow_metrics']:
-                gex_values.append(snap['flow_metrics']['gex_near_total'])
-            else:
-                gex_values.append(float(snap['df']['Net_GEX_B'].sum()))
-    
-    if len(times) < 2:
-        return None
-    
-    fig = make_subplots(
-        rows=2, cols=1,
-        shared_xaxes=True,
-        row_heights=[0.65, 0.35],
-        vertical_spacing=0.08,
-        subplot_titles=('📈 Futures Price', '📊 GEX Flow')
-    )
-    
-    # Price line
-    fig.add_trace(
-        go.Scatter(
-            x=times, y=prices,
-            mode='lines+markers',
-            line=dict(color='#6c5ce7', width=2),
-            marker=dict(size=5),
-            name='Futures',
-            hovertemplate='%{x|%I:%M %p}<br>₹%{y:,.2f}<extra></extra>'
-        ),
-        row=1, col=1
-    )
-    
-    # GEX bars
-    gex_colors = ['#00d4aa' if x > 0 else '#ff6b6b' for x in gex_values]
-    fig.add_trace(
-        go.Bar(
-            x=times, y=gex_values,
-            marker_color=gex_colors,
-            name='GEX Flow',
-            hovertemplate='%{x|%I:%M %p}<br>GEX: %{y:.2f}<extra></extra>'
-        ),
-        row=2, col=1
-    )
-    
-    # Mark selected time
-    if not st.session_state.is_live_mode and st.session_state.selected_time_index is not None:
-        if st.session_state.selected_time_index < len(snapshot_times):
-            selected_time = snapshot_times[st.session_state.selected_time_index]
-            fig.add_vline(x=selected_time, line_dash="dash", line_color="orange", line_width=2)
-    
-    fig.update_layout(
-        height=300,
-        showlegend=False,
-        template='plotly_dark',
-        margin=dict(l=50, r=50, t=50, b=30),
-        paper_bgcolor='rgba(26, 26, 46, 0.8)',
-        plot_bgcolor='rgba(26, 26, 46, 0.8)'
-    )
-    
-    fig.update_xaxes(showgrid=False)
-    fig.update_yaxes(showgrid=True, gridcolor='rgba(255,255,255,0.1)')
-    
-    return fig
+def get_db_snapshots_for_slider(symbol, date):
+    """Get snapshots for time slider"""
+    try:
+        conn = sqlite3.connect(DATABASE_FILE)
+        cursor = conn.cursor()
+        
+        cursor.execute("""
+            SELECT id, timestamp, futures_ltp, total_gex
+            FROM snapshots 
+            WHERE symbol = ? AND DATE(timestamp) = ?
+            ORDER BY timestamp ASC
+        """, (symbol, date))
+        
+        rows = cursor.fetchall()
+        conn.close()
+        
+        return [{'id': r[0], 'timestamp': r[1], 'futures_ltp': r[2], 'total_gex': r[3]} for r in rows]
+    except:
+        return []
 
 
 # ============================================================================
@@ -537,7 +327,7 @@ def create_history_chart(symbol, expiry_index):
 # ============================================================================
 
 st.markdown('<p class="main-header">📊 NYZTrade - Advanced GEX + DEX Analysis</p>', unsafe_allow_html=True)
-st.markdown("**Real-time Gamma & Delta Exposure Analysis | Time Machine for All Expiries**")
+st.markdown("**Real-time Gamma & Delta Exposure Analysis | Historical Database Backtest**")
 
 # User badge
 if user_tier == "premium":
@@ -577,71 +367,176 @@ expiry_index = st.sidebar.selectbox(
     index=0
 )
 
-# Time Machine Stats
+# ============================================================================
+# DATABASE STATUS & TIME MACHINE
+# ============================================================================
+
 st.sidebar.markdown("---")
-st.sidebar.subheader("⏰ Time Machine Stats")
+st.sidebar.subheader("📁 Historical Database")
 
-config_key = get_config_key(symbol, expiry_index)
-config = st.session_state.snapshots_by_config.get(config_key, {'times': []})
-snapshot_count = len(config.get('times', []))
+db_available, db_message = check_database()
 
-if snapshot_count > 0:
-    st.sidebar.metric("Snapshots", snapshot_count)
-    st.sidebar.caption(f"First: {config['times'][0].strftime('%I:%M %p')}")
-    st.sidebar.caption(f"Last: {config['times'][-1].strftime('%I:%M %p')}")
+if db_available:
+    st.sidebar.markdown(f'<div class="db-status">✅ {db_message}</div>', unsafe_allow_html=True)
+    
+    # View Mode Toggle
+    view_mode = st.sidebar.radio(
+        "View Mode",
+        ["🔴 Live Data", "📜 Historical Data"],
+        index=0 if st.session_state.view_mode == 'live' else 1,
+        key="view_mode_radio"
+    )
+    
+    st.session_state.view_mode = 'live' if "Live" in view_mode else 'historical'
+    
+    # Historical data selector
+    if st.session_state.view_mode == 'historical':
+        try:
+            available_dates = get_available_dates(symbol)
+            
+            if available_dates:
+                selected_date = st.sidebar.selectbox(
+                    "Select Date",
+                    available_dates,
+                    format_func=lambda x: datetime.strptime(x, '%Y-%m-%d').strftime('%d %b %Y'),
+                    key="date_selector"
+                )
+                st.session_state.selected_date = selected_date
+            else:
+                st.sidebar.warning(f"No data for {symbol}")
+                st.session_state.view_mode = 'live'
+        except Exception as e:
+            st.sidebar.error(f"Error loading dates: {e}")
+            st.session_state.view_mode = 'live'
 else:
-    st.sidebar.info("No snapshots for this config")
-
-# Manual Capture
-if st.sidebar.button("📸 Capture Now", use_container_width=True, type="primary"):
-    st.session_state.force_capture = True
-
-# Auto-refresh (Premium)
-st.sidebar.markdown("---")
-st.sidebar.subheader("🔄 Auto-Refresh")
-
-if user_tier == "premium":
-    auto_refresh = st.sidebar.checkbox("Enable Auto-Refresh", value=False)
-    if auto_refresh:
-        refresh_interval = st.sidebar.slider("Interval (sec)", 30, 300, 60, step=30)
-        
-        if 'countdown_start' not in st.session_state:
-            st.session_state.countdown_start = time.time()
-        
-        elapsed = time.time() - st.session_state.countdown_start
-        remaining = max(0, refresh_interval - int(elapsed))
-        st.sidebar.markdown(f'<div class="countdown-timer">⏱️ {remaining}s</div>', unsafe_allow_html=True)
-else:
-    st.sidebar.info("🔒 Auto-refresh: Premium only")
-    auto_refresh = False
-    refresh_interval = 60
+    st.sidebar.markdown(f'<div class="db-offline">❌ {db_message}</div>', unsafe_allow_html=True)
+    st.sidebar.info("""
+    **To enable historical data:**
+    1. Run `data_collector.py` 
+    2. Or use `--continuous` mode
+    """)
+    st.session_state.view_mode = 'live'
 
 # Manual Refresh
+st.sidebar.markdown("---")
 if st.sidebar.button("🔄 Refresh Now", use_container_width=True):
     st.cache_data.clear()
-    if 'countdown_start' in st.session_state:
-        st.session_state.countdown_start = time.time()
     st.rerun()
 
 # ============================================================================
-# TIME MACHINE UI
+# TIME MACHINE UI (for historical mode)
 # ============================================================================
 
-historical_data = render_time_machine(symbol, expiry_index)
-
-# History Chart
-config = get_current_snapshots()
-if len(config.get('times', [])) >= 2:
-    history_chart = create_history_chart(symbol, expiry_index)
-    if history_chart:
-        st.plotly_chart(history_chart, use_container_width=True)
+if st.session_state.view_mode == 'historical' and st.session_state.selected_date:
+    st.markdown("---")
+    st.markdown("### ⏰ Time Machine - Historical Backtest")
+    
+    # Get snapshots for selected date
+    snapshots = get_db_snapshots_for_slider(symbol, st.session_state.selected_date)
+    
+    if snapshots:
+        col1, col2 = st.columns([3, 1])
+        
+        with col1:
+            st.caption(f"📊 **{len(snapshots)} snapshots** on {datetime.strptime(st.session_state.selected_date, '%Y-%m-%d').strftime('%d %b %Y')}")
+        
+        with col2:
+            if st.button("🔴 Switch to Live", use_container_width=True):
+                st.session_state.view_mode = 'live'
+                st.rerun()
+        
+        # Time Slider
+        time_labels = []
+        for s in snapshots:
+            try:
+                t = datetime.strptime(s['timestamp'], '%Y-%m-%d %H:%M:%S')
+                time_labels.append(t.strftime('%I:%M %p'))
+            except:
+                time_labels.append(s['timestamp'])
+        
+        selected_idx = st.select_slider(
+            "🕐 Select Time Point",
+            options=list(range(len(snapshots))),
+            value=len(snapshots) - 1,
+            format_func=lambda x: time_labels[x],
+            key="hist_time_slider"
+        )
+        
+        st.session_state.selected_snapshot_id = snapshots[selected_idx]['id']
+        
+        # Quick Jump Buttons
+        st.markdown("**⚡ Quick Jump:**")
+        cols = st.columns(6)
+        jumps = [("First", 0), ("9:30", None), ("11:00", None), ("13:00", None), ("15:00", None), ("Last", -1)]
+        
+        for idx, (label, target) in enumerate(jumps):
+            with cols[idx]:
+                if st.button(label, key=f"jump_{label}", use_container_width=True):
+                    if target == 0:
+                        st.session_state.selected_snapshot_id = snapshots[0]['id']
+                    elif target == -1:
+                        st.session_state.selected_snapshot_id = snapshots[-1]['id']
+                    else:
+                        # Find closest to target time
+                        target_hour = int(label.split(':')[0])
+                        target_min = int(label.split(':')[1]) if ':' in label else 0
+                        
+                        for s in snapshots:
+                            try:
+                                t = datetime.strptime(s['timestamp'], '%Y-%m-%d %H:%M:%S')
+                                if t.hour >= target_hour and t.minute >= target_min:
+                                    st.session_state.selected_snapshot_id = s['id']
+                                    break
+                            except:
+                                pass
+                    st.rerun()
+        
+        # Intraday History Chart from Database
+        try:
+            hist_df = get_intraday_history(symbol, st.session_state.selected_date)
+            
+            if not hist_df.empty:
+                fig = make_subplots(rows=2, cols=1, shared_xaxes=True, row_heights=[0.65, 0.35],
+                                   vertical_spacing=0.08, subplot_titles=('📈 Futures Price', '📊 GEX Flow'))
+                
+                # Convert timestamp
+                hist_df['timestamp'] = pd.to_datetime(hist_df['timestamp'])
+                
+                # Price line
+                fig.add_trace(go.Scatter(x=hist_df['timestamp'], y=hist_df['futures_ltp'],
+                                        mode='lines+markers', line=dict(color='#6c5ce7', width=2),
+                                        marker=dict(size=4), name='Price'), row=1, col=1)
+                
+                # GEX bars
+                gex_colors = ['#00d4aa' if x > 0 else '#ff6b6b' for x in hist_df['total_gex']]
+                fig.add_trace(go.Bar(x=hist_df['timestamp'], y=hist_df['total_gex'],
+                                    marker_color=gex_colors, name='GEX'), row=2, col=1)
+                
+                # Mark selected point
+                selected_snap = next((s for s in snapshots if s['id'] == st.session_state.selected_snapshot_id), None)
+                if selected_snap:
+                    try:
+                        sel_time = datetime.strptime(selected_snap['timestamp'], '%Y-%m-%d %H:%M:%S')
+                        fig.add_vline(x=sel_time, line_dash="dash", line_color="orange", line_width=2)
+                    except:
+                        pass
+                
+                fig.update_layout(height=300, showlegend=False, template='plotly_dark',
+                                 margin=dict(l=50, r=50, t=50, b=30))
+                
+                st.plotly_chart(fig, use_container_width=True)
+        except Exception as e:
+            st.warning(f"Could not load history chart: {e}")
+    else:
+        st.warning("No snapshots found for selected date")
+        st.session_state.view_mode = 'live'
 
 # ============================================================================
 # DATA FETCHING
 # ============================================================================
 
 @st.cache_data(ttl=60, show_spinner=False)
-def fetch_data(symbol, strikes_range, expiry_index):
+def fetch_live_data(symbol, strikes_range, expiry_index):
     if not CALCULATOR_AVAILABLE:
         return None, None, None, None, f"Calculator not available: {IMPORT_ERROR}"
     
@@ -657,38 +552,47 @@ def fetch_data(symbol, strikes_range, expiry_index):
         return None, None, None, None, str(e)
 
 # ============================================================================
-# MAIN ANALYSIS
+# MAIN ANALYSIS - LOAD DATA
 # ============================================================================
 
 st.markdown("---")
 
-# Check if viewing historical data
-if historical_data and not st.session_state.is_live_mode:
-    df = historical_data['df']
-    futures_ltp = historical_data['futures_ltp']
-    fetch_method = historical_data['fetch_method']
-    atm_info = historical_data['atm_info']
-    flow_metrics = historical_data['flow_metrics']
+if st.session_state.view_mode == 'historical' and st.session_state.selected_snapshot_id:
+    # Load from database
+    result = load_snapshot_from_db(st.session_state.selected_snapshot_id)
     
-    is_historical = True
-    config = get_current_snapshots()
-    hist_time = config['times'][st.session_state.selected_time_index]
-    
-    st.warning(f"📜 **HISTORICAL MODE** - Viewing {symbol} data from {hist_time.strftime('%I:%M:%S %p IST')}")
+    if result[0] is not None:
+        df, futures_ltp, fetch_method, atm_info, flow_metrics, timestamp = result
+        is_historical = True
+        
+        try:
+            hist_time = datetime.strptime(timestamp, '%Y-%m-%d %H:%M:%S')
+            hist_time_str = hist_time.strftime('%I:%M:%S %p IST on %d %b %Y')
+        except:
+            hist_time_str = timestamp
+            hist_time = None
+        
+        st.warning(f"📜 **HISTORICAL MODE** - Viewing data from {hist_time_str}")
+    else:
+        st.error("Failed to load historical data")
+        st.session_state.view_mode = 'live'
+        is_historical = False
+        flow_metrics = None
 else:
+    # Fetch live data
     is_historical = False
     hist_time = None
     
     with st.spinner(f"🔄 Fetching live {symbol} data..."):
-        df, futures_ltp, fetch_method, atm_info, error = fetch_data(symbol, strikes_range, expiry_index)
+        df, futures_ltp, fetch_method, atm_info, error = fetch_live_data(symbol, strikes_range, expiry_index)
     
     if error:
         st.error(f"❌ Error: {error}")
         st.info("""
         **Troubleshooting:**
-        1. Make sure gex_calculator.py is in the same folder
-        2. Check requirements.txt includes all dependencies
-        3. Try refreshing the page
+        1. Make sure gex_calculator.py is uploaded
+        2. Check requirements.txt
+        3. Wait 1-2 minutes for dependencies
         """)
         st.stop()
     
@@ -702,13 +606,7 @@ else:
     except Exception as e:
         flow_metrics = None
     
-    # Auto-capture
-    if st.session_state.auto_capture or st.session_state.force_capture:
-        if capture_snapshot(df, futures_ltp, fetch_method, atm_info, flow_metrics, symbol, expiry_index):
-            st.toast("📸 Snapshot captured!", icon="✅")
-    
-    expiry_labels = {0: "Current Weekly", 1: "Next Weekly", 2: "Monthly"}
-    st.success(f"🔴 **LIVE MODE** - {symbol} ({expiry_labels.get(expiry_index, '')}) via {fetch_method}")
+    st.success(f"🔴 **LIVE MODE** - Real-time data via {fetch_method}")
 
 # ============================================================================
 # KEY METRICS
@@ -722,16 +620,22 @@ with col1:
     total_gex = float(df['Net_GEX_B'].sum())
     st.metric(
         "Total Net GEX",
-        f"{total_gex:.2f}",
-        delta="Dampening" if total_gex > 0 else "Amplifying"
+        f"{total_gex:.4f}B",
+        delta="Bullish" if total_gex > 0 else "Volatile"
     )
 
 with col2:
-    call_gex = float(df['Call_GEX'].sum())
+    if 'Call_GEX' in df.columns:
+        call_gex = float(df['Call_GEX'].sum())
+    else:
+        call_gex = float(df[df['Net_GEX_B'] > 0]['Net_GEX_B'].sum())
     st.metric("Call GEX", f"{call_gex:.4f}B")
 
 with col3:
-    put_gex = float(df['Put_GEX'].sum())
+    if 'Put_GEX' in df.columns:
+        put_gex = float(df['Put_GEX'].sum())
+    else:
+        put_gex = float(df[df['Net_GEX_B'] < 0]['Net_GEX_B'].sum())
     st.metric("Put GEX", f"{put_gex:.4f}B")
 
 with col4:
@@ -742,65 +646,42 @@ with col5:
         st.metric("ATM Straddle", f"₹{atm_info['atm_straddle_premium']:.2f}")
 
 # ============================================================================
-# FLOW METRICS WITH UPDATED TERMINOLOGY
+# FLOW METRICS
 # ============================================================================
 
 if flow_metrics:
     st.markdown("---")
-    st.subheader("📈 Flow Analysis")
-    
     col1, col2, col3 = st.columns(3)
     
     with col1:
-        gex_bias = flow_metrics['gex_near_bias']
-        gex_val = flow_metrics['gex_near_total']
-        
-        if "DAMPENING" in gex_bias:
-            st.markdown(f"""
-            <div class="dampening-box">
-                <h4>GEX: {gex_bias}</h4>
-                <p>Near-term: {gex_val:.2f}</p>
-                <small>Market makers will stabilize price</small>
-            </div>
-            """, unsafe_allow_html=True)
+        gex_bias = flow_metrics.get('gex_near_bias', 'N/A')
+        if "BULLISH" in str(gex_bias).upper():
+            st.markdown(f'<div class="success-box"><b>GEX:</b> {gex_bias}</div>', unsafe_allow_html=True)
         else:
-            st.markdown(f"""
-            <div class="amplifying-box">
-                <h4>GEX: {gex_bias}</h4>
-                <p>Near-term: {gex_val:.2f}</p>
-                <small>Market makers will amplify moves</small>
-            </div>
-            """, unsafe_allow_html=True)
+            st.markdown(f'<div class="warning-box"><b>GEX:</b> {gex_bias}</div>', unsafe_allow_html=True)
     
     with col2:
-        dex_bias = flow_metrics['dex_near_bias']
-        dex_val = flow_metrics['dex_near_total']
-        
-        if "BULLISH" in dex_bias:
-            st.markdown(f'<div class="success-box"><b>DEX:</b> {dex_bias}<br>Value: {dex_val:.2f}</div>', unsafe_allow_html=True)
-        elif "BEARISH" in dex_bias:
-            st.markdown(f'<div class="danger-box"><b>DEX:</b> {dex_bias}<br>Value: {dex_val:.2f}</div>', unsafe_allow_html=True)
-        else:
-            st.markdown(f'<div class="warning-box"><b>DEX:</b> {dex_bias}<br>Value: {dex_val:.2f}</div>', unsafe_allow_html=True)
+        dex_bias = flow_metrics.get('dex_near_bias', 'N/A')
+        st.info(f"**DEX Bias:** {dex_bias}")
     
     with col3:
-        combined_bias = flow_metrics['combined_bias']
-        combined_val = flow_metrics['combined_signal']
-        st.info(f"**Combined:** {combined_bias}\n\nSignal: {combined_val:.2f}")
+        combined_bias = flow_metrics.get('combined_bias', 'N/A')
+        st.info(f"**Combined:** {combined_bias}")
+else:
+    st.warning("Flow metrics unavailable")
 
 # ============================================================================
 # GAMMA FLIP ZONES
 # ============================================================================
 
 gamma_flip_zones = []
-try:
-    gamma_flip_zones = detect_gamma_flip_zones(df)
-    if gamma_flip_zones:
-        st.warning(f"⚡ **{len(gamma_flip_zones)} Gamma Flip Zone(s) Detected!** - High volatility areas")
-        for zone in gamma_flip_zones:
-            st.caption(f"  • {zone['lower_strike']} - {zone['upper_strike']}: {zone['flip_type']}")
-except:
-    pass
+if not is_historical:
+    try:
+        gamma_flip_zones = detect_gamma_flip_zones(df)
+        if gamma_flip_zones:
+            st.warning(f"⚡ **{len(gamma_flip_zones)} Gamma Flip Zone(s) Detected!**")
+    except:
+        pass
 
 # ============================================================================
 # CHARTS
@@ -812,13 +693,12 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 GEX Profile", "📈 DEX Profile", 
 
 # TAB 1: GEX Profile
 with tab1:
-    mode_text = f"[HISTORICAL - {hist_time.strftime('%I:%M %p')}]" if is_historical else "[LIVE]"
-    st.subheader(f"{symbol} Gamma Exposure Profile {mode_text}")
+    mode_text = f"[HISTORICAL - {hist_time.strftime('%I:%M %p') if hist_time else 'DB'}]" if is_historical else "[LIVE]"
+    st.subheader(f"NYZTrade - {symbol} Gamma Exposure Profile {mode_text}")
     
     fig = go.Figure()
     
-    # Colors based on volatility impact
-    colors = ['#00d4aa' if x > 0 else '#ff6b6b' for x in df['Net_GEX_B']]
+    colors = ['green' if x > 0 else 'red' for x in df['Net_GEX_B']]
     
     fig.add_trace(go.Bar(
         y=df['Strike'],
@@ -829,7 +709,6 @@ with tab1:
         hovertemplate='<b>Strike:</b> %{y}<br><b>Net GEX:</b> %{x:.4f}B<extra></extra>'
     ))
     
-    # Gamma flip zones
     if gamma_flip_zones:
         max_gex = df['Net_GEX_B'].abs().max()
         for zone in gamma_flip_zones:
@@ -863,24 +742,21 @@ with tab1:
     
     st.plotly_chart(fig, use_container_width=True)
     
-    # Updated interpretation
-    if total_gex > 50:
-        st.success("🟢 **Strong Volatility Dampening**: Market makers will buy dips and sell rallies. Expect range-bound/sideways action.")
-    elif total_gex > 0:
-        st.info("🟢 **Mild Volatility Dampening**: Some stabilization expected, but moves still possible.")
-    elif total_gex > -50:
-        st.warning("🔴 **Mild Volatility Amplifying**: Market makers may amplify moves. Stay cautious.")
+    if total_gex > 0.5:
+        st.success("🟢 **Strong Positive GEX**: Sideways to bullish market expected")
+    elif total_gex < -0.5:
+        st.error("🔴 **Negative GEX**: High volatility expected")
     else:
-        st.error("🔴 **Strong Volatility Amplifying**: High volatility expected! Market makers will amplify directional moves.")
+        st.warning("⚖️ **Neutral GEX**: Mixed signals")
 
 # TAB 2: DEX Profile
 with tab2:
     mode_text = f"[HISTORICAL]" if is_historical else "[LIVE]"
-    st.subheader(f"{symbol} Delta Exposure Profile {mode_text}")
+    st.subheader(f"NYZTrade - {symbol} Delta Exposure Profile {mode_text}")
     
     fig2 = go.Figure()
     
-    dex_colors = ['#00d4aa' if x > 0 else '#ff6b6b' for x in df['Net_DEX_B']]
+    dex_colors = ['green' if x > 0 else 'red' for x in df['Net_DEX_B']]
     
     fig2.add_trace(go.Bar(
         y=df['Strike'],
@@ -909,7 +785,7 @@ with tab2:
 
 # TAB 3: Hedging Pressure
 with tab3:
-    st.subheader(f"{symbol} Hedging Pressure Index")
+    st.subheader(f"NYZTrade - {symbol} Hedging Pressure Index")
     
     fig3 = go.Figure()
     
@@ -921,13 +797,37 @@ with tab3:
             color=df['Hedging_Pressure'],
             colorscale='RdYlGn',
             showscale=True,
-            colorbar=dict(title="Pressure %")
+            colorbar=dict(title="Pressure", x=1.15)
         ),
         name='Hedging Pressure',
         hovertemplate='<b>Strike:</b> %{y}<br><b>Pressure:</b> %{x:.2f}%<extra></extra>'
     ))
     
-    fig3.add_hline(y=futures_ltp, line_dash="dash", line_color="blue", line_width=3)
+    if 'Total_Volume' in df.columns:
+        max_pressure = df['Hedging_Pressure'].abs().max()
+        max_vol = df['Total_Volume'].max()
+        
+        if max_vol > 0:
+            vol_scale = (max_pressure * 0.3) / max_vol
+            scaled_volume = df['Total_Volume'] * vol_scale
+            
+            fig3.add_trace(go.Scatter(
+                y=df['Strike'],
+                x=scaled_volume,
+                mode='lines+markers',
+                line=dict(color='cyan', width=2),
+                marker=dict(size=4),
+                name='Volume',
+                hovertemplate='<b>Strike:</b> %{y}<br><b>Volume:</b> %{customdata:,.0f}<extra></extra>',
+                customdata=df['Total_Volume']
+            ))
+    
+    fig3.add_hline(
+        y=futures_ltp,
+        line_dash="dash",
+        line_color="blue",
+        line_width=3
+    )
     
     fig3.update_layout(
         height=600,
@@ -937,151 +837,70 @@ with tab3:
     )
     
     st.plotly_chart(fig3, use_container_width=True)
-    
-    st.info("""
-    **Hedging Pressure Interpretation:**
-    - **+100%**: Maximum dampening - Strong support level
-    - **-100%**: Maximum amplifying - High volatility zone
-    - **0%**: Neutral - No significant hedging activity
-    """)
 
 # TAB 4: Data Table
 with tab4:
     st.subheader("Strike-wise Analysis")
     
     if is_historical:
-        st.caption(f"📜 Historical data from {hist_time.strftime('%I:%M:%S %p IST')}")
+        st.caption(f"📜 Historical data")
     
-    display_cols = ['Strike', 'Call_OI', 'Put_OI', 'Net_GEX_B', 'Net_DEX_B', 'Hedging_Pressure', 'Total_Volume']
-    display_df = df[[c for c in display_cols if c in df.columns]].copy()
+    display_cols = [c for c in ['Strike', 'Call_OI', 'Put_OI', 'Net_GEX_B', 'Net_DEX_B', 'Hedging_Pressure', 'Total_Volume'] if c in df.columns]
+    display_df = df[display_cols].copy()
     
     st.dataframe(display_df, use_container_width=True, height=400)
     
     csv = df.to_csv(index=False)
     timestamp_str = hist_time.strftime('%Y%m%d_%H%M') if hist_time else get_ist_time().strftime('%Y%m%d_%H%M')
-    
     st.download_button(
         label="📥 Download CSV",
         data=csv,
-        file_name=f"NYZTrade_{symbol}_exp{expiry_index}_{timestamp_str}.csv",
+        file_name=f"NYZTrade_{symbol}_{timestamp_str}.csv",
         mime="text/csv",
         use_container_width=True
     )
 
 # TAB 5: Strategies
 with tab5:
-    st.subheader("💡 Trading Strategies Based on GEX/DEX")
+    st.subheader("💡 Trading Strategies")
     
     if is_historical:
-        st.info(f"📜 Strategies based on historical data from {hist_time.strftime('%I:%M %p IST')}")
+        st.info(f"📜 Strategies based on historical data")
     
     if flow_metrics and atm_info:
-        gex_val = flow_metrics['gex_near_total']
-        dex_val = flow_metrics['dex_near_total']
+        gex_bias_val = flow_metrics.get('gex_near_total', total_gex)
+        dex_bias_val = flow_metrics.get('dex_near_total', 0)
         
-        st.markdown("### 📊 Current Market Setup")
+        st.markdown("### 📊 Market Setup")
         
         col1, col2 = st.columns(2)
         with col1:
-            st.metric("GEX Flow", f"{gex_val:.2f}", "Dampening" if gex_val > 0 else "Amplifying")
-            st.metric("DEX Flow", f"{dex_val:.2f}", "Bullish" if dex_val > 0 else "Bearish")
+            st.metric("GEX Flow", f"{gex_bias_val:.2f}")
+            st.metric("DEX Flow", f"{dex_bias_val:.2f}")
         with col2:
             st.metric("ATM Strike", f"{atm_info['atm_strike']}")
-            st.metric("Straddle Premium", f"₹{atm_info['atm_straddle_premium']:.2f}")
+            st.metric("Straddle", f"₹{atm_info['atm_straddle_premium']:.2f}")
         
         st.markdown("---")
         
-        # Strategy recommendations based on volatility regime
-        if gex_val > 50:
-            st.success("### 🟢 Volatility Dampening Regime")
-            st.markdown("""
-            **Market Behavior:** Range-bound, mean-reverting
-            
-            **Recommended Strategies:**
-            """)
-            
+        if gex_bias_val > 50:
+            st.success("### 🟢 Strong Positive GEX - Sideways/Bullish")
             st.code(f"""
-Strategy 1: Iron Condor (High Probability)
-------------------------------------------
-Sell {symbol} {int(futures_ltp + 100)} CE
-Buy  {symbol} {int(futures_ltp + 200)} CE  
-Sell {symbol} {int(futures_ltp - 100)} PE
-Buy  {symbol} {int(futures_ltp - 200)} PE
-
-Expected Range: {int(futures_ltp - 100)} to {int(futures_ltp + 100)}
-Risk: MODERATE | Reward: Premium collected
-            """)
-            
-            st.code(f"""
-Strategy 2: Short Straddle (Aggressive)
----------------------------------------
-Sell {symbol} {atm_info['atm_strike']} CE
-Sell {symbol} {atm_info['atm_strike']} PE
-
+Strategy: Iron Condor / Short Straddle
+ATM: {atm_info['atm_strike']}
 Premium: ₹{atm_info['atm_straddle_premium']:.2f}
-Max Profit: At ATM strike
-Risk: UNLIMITED - Use strict stops!
             """)
-            
-        elif gex_val < -50:
-            st.error("### 🔴 Volatility Amplifying Regime")
-            st.markdown("""
-            **Market Behavior:** Trending, breakout-prone
-            
-            **Recommended Strategies:**
-            """)
-            
+        elif gex_bias_val < -50:
+            st.error("### 🔴 Negative GEX - High Volatility")
             st.code(f"""
-Strategy 1: Long Straddle (Volatility Play)
--------------------------------------------
-Buy {symbol} {atm_info['atm_strike']} CE
-Buy {symbol} {atm_info['atm_strike']} PE
-
+Strategy: Long Straddle
+ATM: {atm_info['atm_strike']}
 Cost: ₹{atm_info['atm_straddle_premium']:.2f}
-Upper BE: {atm_info['atm_strike'] + atm_info['atm_straddle_premium']:.0f}
-Lower BE: {atm_info['atm_strike'] - atm_info['atm_straddle_premium']:.0f}
-Risk: Premium paid | Reward: UNLIMITED
             """)
-            
-            if dex_val > 20:
-                st.code(f"""
-Strategy 2: Bull Call Spread (Directional)
-------------------------------------------
-Buy  {symbol} {int(futures_ltp)} CE
-Sell {symbol} {int(futures_ltp + 150)} CE
-
-Bias: BULLISH (DEX confirms)
-Risk: DEFINED
-                """)
-            elif dex_val < -20:
-                st.code(f"""
-Strategy 2: Bear Put Spread (Directional)
------------------------------------------
-Buy  {symbol} {int(futures_ltp)} PE
-Sell {symbol} {int(futures_ltp - 150)} PE
-
-Bias: BEARISH (DEX confirms)
-Risk: DEFINED
-                """)
         else:
-            st.warning("### ⚖️ Neutral/Transitional Regime")
-            st.markdown("""
-            **Market Behavior:** Mixed signals, wait for clarity
-            
-            **Recommended:** Wait for stronger GEX signal or trade with tight stops
-            """)
-        
-        st.markdown("---")
-        st.markdown("### ⚠️ Risk Management Rules")
-        st.markdown("""
-        1. **Position Size:** Max 2% capital per trade
-        2. **Stop Loss:** Always use - especially in amplifying regime
-        3. **Theta Decay:** Monitor time decay in long positions
-        4. **Gamma Flip Zones:** Avoid tight stops near flip zones
-        5. **Take Profit:** 50-70% of max profit for credit strategies
-        """)
+            st.warning("### ⚖️ Neutral - Wait for Clarity")
     else:
-        st.warning("Flow metrics unavailable")
+        st.warning("Metrics unavailable")
 
 # ============================================================================
 # FOOTER
@@ -1096,32 +915,18 @@ with col1:
     st.info(f"⏰ {ist_time.strftime('%H:%M:%S')} IST")
 
 with col2:
-    if atm_info:
-        st.info(f"📅 Expiry: {atm_info.get('expiry_date', 'N/A')}")
+    st.info(f"📅 {ist_time.strftime('%d %b %Y')}")
 
 with col3:
     if is_historical:
-        st.warning(f"📜 Historical: {hist_time.strftime('%I:%M %p')}")
+        st.warning(f"📜 Historical")
     else:
         st.success(f"🔴 Live: {symbol}")
 
 with col4:
-    if gamma_flip_zones:
-        st.warning(f"⚡ {len(gamma_flip_zones)} Flip Zone(s)")
+    if db_available:
+        st.success("💾 DB Online")
     else:
-        st.success("✅ No Flip Zones")
+        st.error("💾 DB Offline")
 
-st.markdown(f"**💡 NYZTrade YouTube | Data: {fetch_method} | Config: {symbol}_Exp{expiry_index}**")
-
-# ============================================================================
-# AUTO-REFRESH
-# ============================================================================
-
-if auto_refresh and user_tier == "premium" and st.session_state.is_live_mode:
-    elapsed = time.time() - st.session_state.countdown_start
-    if elapsed >= refresh_interval:
-        st.session_state.countdown_start = time.time()
-        st.rerun()
-    else:
-        time.sleep(1)
-        st.rerun()
+st.markdown(f"**💡 NYZTrade YouTube | Data: {fetch_method if not is_historical else 'Database'}**")
