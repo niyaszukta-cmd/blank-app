@@ -1027,9 +1027,3 @@ if auto_refresh and user_tier == "premium" and st.session_state.is_live_mode:
     else:
         time.sleep(1)
         st.rerun()
-
-
-
-
-
-
